@@ -35,6 +35,9 @@ pub struct Cli {
 
     #[arg(long, default_value_t = 1000)]
     pub get_recent_max_limit: usize,
+
+    #[arg(long, default_value_t = 0)]
+    pub workers: usize,
 }
 
 pub fn env_or(key: &str, default: &str) -> String {
@@ -99,6 +102,21 @@ impl Cli {
                 .ok()
                 .map(|s| matches!(s.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
                 .unwrap_or(true);
+        }
+        if self.workers == 0 {
+            self.workers = std::env::var("NEKO_MESSAGE_PLANE_WORKERS")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+        }
+    }
+    
+    /// Get effective worker count (0 means auto-detect CPU cores)
+    pub fn get_workers(&self) -> usize {
+        if self.workers == 0 {
+            num_cpus::get().max(4)
+        } else {
+            self.workers
         }
     }
 

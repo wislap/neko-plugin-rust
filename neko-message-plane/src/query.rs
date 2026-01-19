@@ -1,10 +1,11 @@
 use regex::Regex;
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::types::{Event, Store};
 
-pub fn dedupe_key(ev: &Event) -> (String, String) {
+pub fn dedupe_key(ev: &Arc<Event>) -> (String, String) {
     if let Some(idv) = ev
         .index_json
         .as_ref()
@@ -32,8 +33,8 @@ pub fn field_value(ev: &Event, field: &str) -> Option<JsonValue> {
     match field {
         "seq" => Some(JsonValue::from(ev.seq)),
         "ts" => Some(JsonValue::from(ev.ts)),
-        "store" => Some(JsonValue::from(ev.store.clone())),
-        "topic" => Some(JsonValue::from(ev.topic.clone())),
+        "store" => Some(JsonValue::from(ev.store.as_ref())),
+        "topic" => Some(JsonValue::from(ev.topic.as_ref())),
         _ => None,
     }
 }
@@ -76,10 +77,10 @@ fn maybe_match_regex(pattern: &str, value: Option<&JsonValue>, strict: bool) -> 
 }
 
 pub fn apply_unary_op(
-    items: Vec<Event>,
+    items: Vec<Arc<Event>>,
     op: &str,
     params: &serde_json::Map<String, JsonValue>,
-) -> Option<Vec<Event>> {
+) -> Option<Vec<Arc<Event>>> {
     if op == "limit" {
         let n = params.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
         if n <= 0 {
@@ -143,7 +144,7 @@ pub fn apply_unary_op(
             }
         }
 
-        let mut out: Vec<Event> = Vec::new();
+        let mut out: Vec<Arc<Event>> = Vec::new();
         for ev in items.into_iter() {
             // equality checks
             let mut ok = true;
@@ -347,12 +348,12 @@ pub fn apply_unary_op(
         // Validate pattern once
         let ok_pat = maybe_match_regex(pattern, Some(&JsonValue::String("".to_string())), strict);
         if ok_pat == Some(false) {
-            return Some(if strict { vec![] } else { items });
+            return if strict { Some(vec![]) } else { Some(items) };
         }
         if ok_pat.is_none() {
             return Some(items);
         }
-        let mut out = Vec::new();
+        let mut out: Vec<Arc<Event>> = Vec::new();
         for ev in items {
             let got = field_value(&ev, &field);
             let verdict = maybe_match_regex(pattern, got.as_ref(), strict);
@@ -366,15 +367,15 @@ pub fn apply_unary_op(
     None
 }
 
-pub fn apply_binary_op(left: Vec<Event>, right: Vec<Event>, op: &str) -> Option<Vec<Event>> {
+pub fn apply_binary_op(left: Vec<Arc<Event>>, right: Vec<Arc<Event>>, op: &str) -> Option<Vec<Arc<Event>>> {
     if op != "merge" && op != "intersection" && op != "difference" {
         return None;
     }
-    let right_keys: Vec<(String, String)> = right.iter().map(dedupe_key).collect();
+    let right_keys: Vec<(String, String)> = right.iter().map(|ev| dedupe_key(ev)).collect();
     let set_right: HashSet<(String, String)> = right_keys.into_iter().collect();
 
     if op == "merge" {
-        let mut merged: Vec<Event> = Vec::new();
+        let mut merged: Vec<Arc<Event>> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for ev in left.into_iter().chain(right.into_iter()) {
             let k = dedupe_key(&ev);
@@ -389,7 +390,7 @@ pub fn apply_binary_op(left: Vec<Event>, right: Vec<Event>, op: &str) -> Option<
     }
 
     if op == "intersection" {
-        let mut kept: Vec<Event> = Vec::new();
+        let mut kept: Vec<Arc<Event>> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for ev in left.into_iter() {
             let k = dedupe_key(&ev);
@@ -407,7 +408,7 @@ pub fn apply_binary_op(left: Vec<Event>, right: Vec<Event>, op: &str) -> Option<
     }
 
     if op == "difference" {
-        let mut kept: Vec<Event> = Vec::new();
+        let mut kept: Vec<Arc<Event>> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for ev in left.into_iter() {
             let k = dedupe_key(&ev);
@@ -427,7 +428,7 @@ pub fn apply_binary_op(left: Vec<Event>, right: Vec<Event>, op: &str) -> Option<
     None
 }
 
-pub fn eval_plan(store: &Store, node: &JsonValue) -> Option<Vec<Event>> {
+pub fn eval_plan(store: &Store, node: &JsonValue) -> Option<Vec<Arc<Event>>> {
     let obj = node.as_object()?;
     let kind = obj.get("kind")?.as_str().unwrap_or("");
     let op = obj.get("op").and_then(|v| v.as_str()).unwrap_or("");
@@ -492,12 +493,12 @@ pub fn eval_plan(store: &Store, node: &JsonValue) -> Option<Vec<Event>> {
         }
 
         // Use existing query behavior over a single topic
-        let mut snapshots: Vec<Event> = Vec::new();
+        let mut snapshots: Vec<Arc<Event>> = Vec::new();
         if let Some(dq_arc) = store.topics.get(topic) {
             let dq = dq_arc.read();
             snapshots.extend(dq.iter().cloned());
         }
-        let mut out: Vec<Event> = Vec::new();
+        let mut out: Vec<Arc<Event>> = Vec::new();
         for ev in snapshots {
             let idx = match ev.index_json.as_ref().as_object() {
                 Some(o) => o,

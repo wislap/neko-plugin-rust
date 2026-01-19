@@ -1,8 +1,8 @@
-use parking_lot::Mutex;
 use rmpv::Value as MpValue;
 use serde_json::Value as JsonValue;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use crate::query::eval_plan;
 use crate::rpc::{
@@ -11,6 +11,16 @@ use crate::rpc::{
 };
 use crate::types::{Event, MpState, PubMsg};
 use crate::utils::{json_obj, mp_get, mp_get_str, mp_to_json, now_ts};
+
+static VALIDATE_MODE: OnceLock<String> = OnceLock::new();
+
+fn get_validate_mode() -> &'static str {
+    VALIDATE_MODE.get_or_init(|| {
+        std::env::var("NEKO_MESSAGE_PLANE_VALIDATE_MODE")
+            .unwrap_or_else(|_| "strict".to_string())
+            .to_lowercase()
+    })
+}
 
 /// Handle RPC request in MessagePack format
 pub fn handle_rpc_mp(
@@ -23,9 +33,7 @@ pub fn handle_rpc_mp(
     let args = mp_get(req, "args").cloned().unwrap_or(MpValue::Nil);
     let args_obj = args.as_map().cloned().unwrap_or_default();
 
-    let mode = std::env::var("NEKO_MESSAGE_PLANE_VALIDATE_MODE")
-        .unwrap_or_else(|_| "strict".to_string())
-        .to_lowercase();
+    let mode = get_validate_mode();
     let strict = mode == "strict";
 
     let v_raw = mp_get(req, "v");
@@ -282,7 +290,7 @@ fn handle_query_mp(
         .and_then(|v| v.as_f64())
         .or_else(|| mp_get_str(args, "until_ts").and_then(|s| s.parse::<f64>().ok()));
 
-    let mut snapshots: Vec<Event> = Vec::new();
+    let mut snapshots: Vec<Arc<Event>> = Vec::new();
     if let Some(s) = state.store(store) {
         if topic.trim() == "*" {
             for entry in s.topics.iter() {
@@ -295,7 +303,7 @@ fn handle_query_mp(
         }
     }
 
-    let mut out: Vec<Event> = Vec::new();
+    let mut out: Vec<Arc<Event>> = Vec::new();
     for ev in snapshots {
         let idx = match ev.index_json.as_ref().as_object() {
             Some(o) => o,
@@ -414,8 +422,8 @@ fn handle_publish_mp(
             body: rmp_serde::to_vec_named(&serde_json::json!({
                 "seq": ev.seq,
                 "ts": ev.ts,
-                "store": ev.store,
-                "topic": ev.topic,
+                "store": ev.store.as_ref(),
+                "topic": ev.topic.as_ref(),
                 "payload": (*ev.payload_json).clone(),
                 "index": (*ev.index_json).clone(),
             }))
@@ -426,8 +434,8 @@ fn handle_publish_mp(
     let mut ev_map: Vec<(MpValue, MpValue)> = Vec::with_capacity(6);
     ev_map.push((MpValue::from("seq"), MpValue::from(ev.seq as i64)));
     ev_map.push((MpValue::from("ts"), MpValue::from(ev.ts)));
-    ev_map.push((MpValue::from("store"), MpValue::from(ev.store.as_str())));
-    ev_map.push((MpValue::from("topic"), MpValue::from(ev.topic.as_str())));
+    ev_map.push((MpValue::from("store"), MpValue::from(ev.store.as_ref())));
+    ev_map.push((MpValue::from("topic"), MpValue::from(ev.topic.as_ref())));
     ev_map.push((MpValue::from("payload"), (*ev.payload_mp).clone()));
     ev_map.push((MpValue::from("index"), (*ev.index_mp).clone()));
 
@@ -441,14 +449,14 @@ fn handle_publish_mp(
 }
 
 /// Convert events to MessagePack value vector
-fn events_to_mp_vec(items: &[Event], light: bool) -> Vec<MpValue> {
+fn events_to_mp_vec(items: &[Arc<Event>], light: bool) -> Vec<MpValue> {
     let mut out_items: Vec<MpValue> = Vec::with_capacity(items.len());
     for ev in items {
         let mut m: Vec<(MpValue, MpValue)> = Vec::with_capacity(if light { 5 } else { 6 });
         m.push((MpValue::from("seq"), MpValue::from(ev.seq as i64)));
         m.push((MpValue::from("ts"), MpValue::from(ev.ts)));
-        m.push((MpValue::from("store"), MpValue::from(ev.store.as_str())));
-        m.push((MpValue::from("topic"), MpValue::from(ev.topic.as_str())));
+        m.push((MpValue::from("store"), MpValue::from(ev.store.as_ref())));
+        m.push((MpValue::from("topic"), MpValue::from(ev.topic.as_ref())));
         if !light {
             m.push((MpValue::from("payload"), (*ev.payload_mp).clone()));
         }
@@ -573,16 +581,16 @@ pub fn handle_rpc(
                     serde_json::json!({
                         "seq": ev.seq,
                         "ts": ev.ts,
-                        "store": ev.store,
-                        "topic": ev.topic,
+                        "store": ev.store.as_ref(),
+                        "topic": ev.topic.as_ref(),
                         "index": (*ev.index_json).clone(),
                     })
                 } else {
                     serde_json::json!({
                         "seq": ev.seq,
                         "ts": ev.ts,
-                        "store": ev.store,
-                        "topic": ev.topic,
+                        "store": ev.store.as_ref(),
+                        "topic": ev.topic.as_ref(),
                         "payload": (*ev.payload_json).clone(),
                         "index": (*ev.index_json).clone(),
                     })
@@ -650,8 +658,8 @@ pub fn handle_rpc(
                 let body = serde_json::to_vec(&serde_json::json!({
                     "seq": ev.seq,
                     "ts": ev.ts,
-                    "store": ev.store,
-                    "topic": ev.topic,
+                    "store": ev.store.as_ref(),
+                    "topic": ev.topic.as_ref(),
                     "payload": (*ev.payload_json).clone(),
                     "index": (*ev.index_json).clone(),
                 }))
@@ -663,8 +671,8 @@ pub fn handle_rpc(
         return serde_json::json!({"v":1,"req_id":req_id,"ok":true,"result":{"accepted":true,"event":{
             "seq": ev.seq,
             "ts": ev.ts,
-            "store": ev.store,
-            "topic": ev.topic,
+            "store": ev.store.as_ref(),
+            "topic": ev.topic.as_ref(),
             "payload": (*ev.payload_json).clone(),
             "index": (*ev.index_json).clone()
         }},"error":null});

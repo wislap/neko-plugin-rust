@@ -13,8 +13,8 @@ use crate::utils::extract_index;
 pub struct Event {
     pub seq: u64,
     pub ts: f64,
-    pub store: String,
-    pub topic: String,
+    pub store: Arc<str>,
+    pub topic: Arc<str>,
     pub payload_json: Arc<JsonValue>,
     pub index_json: Arc<JsonValue>,
     pub payload_mp: Arc<MpValue>,
@@ -35,10 +35,10 @@ pub struct Store {
     #[allow(dead_code)]
     pub topic_max: usize,
     pub next_seq: AtomicU64,
-    pub topics: DashMap<String, Arc<RwLock<VecDeque<Event>>>>,
+    pub topics: DashMap<String, Arc<RwLock<VecDeque<Arc<Event>>>>>,
     pub meta: DashMap<String, TopicMeta>,
     // Read cache: lock-free recent events for fast get_recent
-    pub read_cache: DashMap<String, Vec<Event>>,
+    pub read_cache: DashMap<String, Vec<Arc<Event>>>,
 }
 
 impl Store {
@@ -53,7 +53,8 @@ impl Store {
         }
     }
 
-    pub fn publish(&self, store: &str, topic: &str, payload: JsonValue) -> Event {
+    #[inline]
+    pub fn publish(&self, store: &str, topic: &str, payload: JsonValue) -> Arc<Event> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
@@ -68,16 +69,16 @@ impl Store {
         let payload_mp = Arc::new(rmpv::ext::to_value(payload_json.as_ref()).unwrap_or(MpValue::Nil));
         let index_mp = Arc::new(rmpv::ext::to_value(index_json.as_ref()).unwrap_or(MpValue::Nil));
 
-        let ev = Event {
+        let ev = Arc::new(Event {
             seq,
             ts,
-            store: store.to_string(),
-            topic: topic.to_string(),
+            store: Arc::from(store),
+            topic: Arc::from(topic),
             payload_json,
             index_json,
             payload_mp,
             index_mp,
-        };
+        });
 
         // Update or create metadata
         self.meta.entry(topic.to_string()).or_insert_with(|| TopicMeta {
@@ -94,7 +95,7 @@ impl Store {
         // Write to queue
         {
             let mut q = queue.write();
-            q.push_back(ev.clone());
+            q.push_back(Arc::clone(&ev));
             while q.len() > self.maxlen {
                 q.pop_front();
             }
@@ -112,7 +113,7 @@ impl Store {
         ev
     }
 
-    pub fn replace_topic(&self, store: &str, topic: &str, items: Vec<JsonValue>) -> Vec<Event> {
+    pub fn replace_topic(&self, store: &str, topic: &str, items: Vec<JsonValue>) -> Vec<Arc<Event>> {
         let mut out = Vec::with_capacity(items.len());
         
         let queue = self.topics.entry(topic.to_string()).or_insert_with(|| {
@@ -139,12 +140,13 @@ impl Store {
         out
     }
 
-    pub fn get_recent(&self, _store: &str, topic: &str, limit: usize) -> Vec<Event> {
+    #[inline]
+    pub fn get_recent(&self, _store: &str, topic: &str, limit: usize) -> Vec<Arc<Event>> {
         // Fast path: try read cache first (lock-free)
         if let Some(cache) = self.read_cache.get(topic) {
             let n = limit.min(cache.len());
             let start = cache.len().saturating_sub(n);
-            return cache.iter().skip(start).cloned().collect();
+            return cache[start..].to_vec();
         }
         
         // Slow path: read from queue with lock
@@ -158,11 +160,12 @@ impl Store {
         q.iter().skip(start).cloned().collect()
     }
     
+    #[inline]
     fn update_read_cache(&self, topic: &str) {
         // Update read cache asynchronously (best-effort, no blocking)
         if let Some(queue) = self.topics.get(topic) {
             if let Some(q) = queue.try_read() {
-                let cache: Vec<Event> = q.iter().cloned().collect();
+                let cache: Vec<Arc<Event>> = q.iter().cloned().collect();
                 self.read_cache.insert(topic.to_string(), cache);
             }
         }
