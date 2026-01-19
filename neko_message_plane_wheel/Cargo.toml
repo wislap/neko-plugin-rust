@@ -1,0 +1,11 @@
+[package]
+name = "neko_message_plane_wheel"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "neko_message_plane_wheel"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }

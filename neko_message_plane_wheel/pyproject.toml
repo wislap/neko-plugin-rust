@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "neko-message-plane-bin"
+version = "0.2.0"
+description = "N.E.K.O message plane launcher (bundled Rust binary)"
+requires-python = ">=3.11"
+
+[project.scripts]
+neko-message-plane = "neko_message_plane_wheel.cli:main"
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "neko_message_plane_wheel._native"
+python-source = "python"
+include = [
+  "python/neko_message_plane_wheel/bin/**",
+]
