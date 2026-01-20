@@ -52,18 +52,30 @@ pub struct RpcHealthResult {
     pub ts: f64,
 }
 
+/// Lightweight event view for serialization without cloning MpValue
 #[derive(Serialize)]
-pub struct RpcGetRecentResult {
+pub struct EventView<'a> {
+    pub seq: i64,
+    pub ts: f64,
+    pub store: &'a str,
+    pub topic: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<&'a MpValue>,
+    pub index: &'a MpValue,
+}
+
+#[derive(Serialize)]
+pub struct RpcGetRecentResult<'a> {
     pub store: String,
     pub topic: String,
-    pub items: Vec<MpValue>,
+    pub items: Vec<EventView<'a>>,
     pub light: bool,
 }
 
 #[derive(Serialize)]
-pub struct RpcReplayResult {
+pub struct RpcReplayResult<'a> {
     pub store: String,
-    pub items: Vec<MpValue>,
+    pub items: Vec<EventView<'a>>,
     pub light: bool,
 }
 

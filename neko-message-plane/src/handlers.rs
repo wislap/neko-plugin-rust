@@ -14,6 +14,67 @@ use crate::utils::{json_obj, mp_get, mp_get_str, mp_to_json, now_ts};
 
 static VALIDATE_MODE: OnceLock<String> = OnceLock::new();
 
+// ============ PERF MARKER FUNCTIONS ============
+// These functions are used for perf profiling to identify code sections.
+// They should show up in perf call graphs to help answer:
+// 1. reload 在等谁？ (where is wait happening)
+// 2. replay 是否全量？ (is replay doing full scan)
+// 3. clone / serialize 是不是必经之路？ (is clone/serialize on critical path)
+
+/// Marker: waiting for data (e.g., store lock, ZMQ recv)
+#[inline(never)]
+#[cold]
+pub fn perf_marker_wait_begin() {
+    std::hint::black_box(());
+}
+
+#[inline(never)]
+#[cold]
+pub fn perf_marker_wait_end() {
+    std::hint::black_box(());
+}
+
+/// Marker: applying/processing data
+#[inline(never)]
+#[cold]
+pub fn perf_marker_apply_begin() {
+    std::hint::black_box(());
+}
+
+#[inline(never)]
+#[cold]
+pub fn perf_marker_apply_end() {
+    std::hint::black_box(());
+}
+
+/// Marker: serialization phase
+#[inline(never)]
+#[cold]
+pub fn perf_marker_serialize_begin() {
+    std::hint::black_box(());
+}
+
+#[inline(never)]
+#[cold]
+pub fn perf_marker_serialize_end() {
+    std::hint::black_box(());
+}
+
+/// Marker: clone phase
+#[inline(never)]
+#[cold]
+pub fn perf_marker_clone_begin() {
+    std::hint::black_box(());
+}
+
+#[inline(never)]
+#[cold]
+pub fn perf_marker_clone_end() {
+    std::hint::black_box(());
+}
+
+// ============ END PERF MARKERS ============
+
 fn get_validate_mode() -> &'static str {
     VALIDATE_MODE.get_or_init(|| {
         std::env::var("NEKO_MESSAGE_PLANE_VALIDATE_MODE")
@@ -94,6 +155,7 @@ pub fn handle_rpc_mp(
     rpc_err(req_id, "UNKNOWN_OP", &format!("unknown op: {}", op), None)
 }
 
+#[inline(never)]
 fn handle_get_recent_mp(
     req_id: &str,
     args_obj: &[(MpValue, MpValue)],
@@ -147,13 +209,25 @@ fn handle_get_recent_mp(
         limit = max_limit;
     }
 
+    // PERF: wait for store lock
+    perf_marker_wait_begin();
     let items = match state.store(&store) {
         Some(s) => s.get_recent("", &topic, limit),
-        None => return rpc_err(req_id, "BAD_STORE", "invalid store", None),
+        None => {
+            perf_marker_wait_end();
+            return rpc_err(req_id, "BAD_STORE", "invalid store", None);
+        }
     };
+    perf_marker_wait_end();
 
-    let out_items = events_to_mp_vec(&items, light);
-    rpc_ok(
+    // PERF: apply/transform phase
+    perf_marker_apply_begin();
+    let out_items = events_to_views(&items, light);
+    perf_marker_apply_end();
+
+    // PERF: serialize phase
+    perf_marker_serialize_begin();
+    let result = rpc_ok(
         req_id,
         RpcGetRecentResult {
             store,
@@ -161,7 +235,9 @@ fn handle_get_recent_mp(
             items: out_items,
             light,
         },
-    )
+    );
+    perf_marker_serialize_end();
+    result
 }
 
 fn handle_get_since_mp(
@@ -244,6 +320,7 @@ fn handle_get_since_mp(
     )
 }
 
+#[inline(never)]
 fn handle_replay_mp(
     req_id: &str,
     args: &MpValue,
@@ -287,10 +364,16 @@ fn handle_replay_mp(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // PERF: wait for store lock + eval_plan (full scan)
+    perf_marker_wait_begin();
     let items = match state.store(store_name) {
         Some(store_ref) => eval_plan(&*store_ref, &plan_json),
-        None => return rpc_err(req_id, "BAD_STORE", "invalid store", None),
+        None => {
+            perf_marker_wait_end();
+            return rpc_err(req_id, "BAD_STORE", "invalid store", None);
+        }
     };
+    perf_marker_wait_end();
 
     let mut items = match items {
         Some(v) => v,
@@ -305,15 +388,23 @@ fn handle_replay_mp(
         items.truncate(max_limit);
     }
 
-    let out_items = events_to_mp_vec(&items, light);
-    rpc_ok(
+    // PERF: apply phase (zero-copy EventView, no clone needed)
+    perf_marker_apply_begin();
+    let out_items = events_to_views(&items, light);
+    perf_marker_apply_end();
+
+    // PERF: serialize phase
+    perf_marker_serialize_begin();
+    let result = rpc_ok(
         req_id,
         RpcReplayResult {
             store: store_name.to_string(),
             items: out_items,
             light,
         },
-    )
+    );
+    perf_marker_serialize_end();
+    result
 }
 
 fn handle_query_mp(
@@ -547,19 +638,44 @@ fn handle_publish_mp(
     )
 }
 
-/// Convert events to MessagePack value vector
+use crate::rpc::EventView;
+
+/// Convert events to EventView vector (zero-copy references)
+fn events_to_views<'a>(items: &'a [Arc<Event>], light: bool) -> Vec<EventView<'a>> {
+    items.iter().map(|ev| EventView {
+        seq: ev.seq as i64,
+        ts: ev.ts,
+        store: ev.store.as_ref(),
+        topic: ev.topic.as_ref(),
+        payload: if light { None } else { Some(ev.payload_mp.as_ref()) },
+        index: ev.index_mp.as_ref(),
+    }).collect()
+}
+
+/// Convert events to MessagePack value vector (legacy, for replay/query)
+/// Optimized to reuse string allocations and reduce Vec allocations
+#[inline(never)]
 fn events_to_mp_vec(items: &[Arc<Event>], light: bool) -> Vec<MpValue> {
+    // Pre-allocate static keys as MpValue to avoid repeated conversions
+    let key_seq = MpValue::from("seq");
+    let key_ts = MpValue::from("ts");
+    let key_store = MpValue::from("store");
+    let key_topic = MpValue::from("topic");
+    let key_payload = MpValue::from("payload");
+    let key_index = MpValue::from("index");
+    
     let mut out_items: Vec<MpValue> = Vec::with_capacity(items.len());
     for ev in items {
-        let mut m: Vec<(MpValue, MpValue)> = Vec::with_capacity(if light { 5 } else { 6 });
-        m.push((MpValue::from("seq"), MpValue::from(ev.seq as i64)));
-        m.push((MpValue::from("ts"), MpValue::from(ev.ts)));
-        m.push((MpValue::from("store"), MpValue::from(ev.store.as_ref())));
-        m.push((MpValue::from("topic"), MpValue::from(ev.topic.as_ref())));
+        let cap = if light { 5 } else { 6 };
+        let mut m: Vec<(MpValue, MpValue)> = Vec::with_capacity(cap);
+        m.push((key_seq.clone(), MpValue::from(ev.seq as i64)));
+        m.push((key_ts.clone(), MpValue::from(ev.ts)));
+        m.push((key_store.clone(), MpValue::from(ev.store.as_ref())));
+        m.push((key_topic.clone(), MpValue::from(ev.topic.as_ref())));
         if !light {
-            m.push((MpValue::from("payload"), (*ev.payload_mp).clone()));
+            m.push((key_payload.clone(), (*ev.payload_mp).clone()));
         }
-        m.push((MpValue::from("index"), (*ev.index_mp).clone()));
+        m.push((key_index.clone(), (*ev.index_mp).clone()));
         out_items.push(MpValue::Map(m));
     }
     out_items
