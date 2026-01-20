@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use crate::query::eval_plan;
 use crate::rpc::{
-    rpc_err, rpc_ok, RpcGetRecentResult, RpcHealthResult, RpcPublishResult, RpcQueryResult,
+    rpc_err, rpc_ok, RpcGetRecentResult, RpcGetSinceResult, RpcHealthResult, RpcPublishResult, RpcQueryResult,
     RpcReplayResult,
 };
 use crate::types::{Event, MpState, PubMsg};
@@ -78,6 +78,10 @@ pub fn handle_rpc_mp(
 
     if op == "bus.query" {
         return handle_query_mp(req_id, &args, &mode, state);
+    }
+
+    if op == "bus.get_since" {
+        return handle_get_since_mp(req_id, &args_obj, state);
     }
 
     if op == "bus.publish" {
@@ -156,6 +160,86 @@ fn handle_get_recent_mp(
             topic,
             items: out_items,
             light,
+        },
+    )
+}
+
+fn handle_get_since_mp(
+    req_id: &str,
+    args_obj: &[(MpValue, MpValue)],
+    state: &Arc<MpState>,
+) -> Vec<u8> {
+    let store = {
+        let mut s = "messages";
+        for (k, v) in args_obj.iter() {
+            if k.as_str() == Some("store") {
+                if let Some(ss) = v.as_str() {
+                    s = ss;
+                }
+            }
+        }
+        s.to_string()
+    };
+    let topic = {
+        let mut t = "all";
+        for (k, v) in args_obj.iter() {
+            if k.as_str() == Some("topic") {
+                if let Some(ts) = v.as_str() {
+                    t = ts;
+                }
+            }
+        }
+        t.to_string()
+    };
+    let mut after_seq: u64 = 0;
+    let mut limit: usize = 200;
+    for (k, v) in args_obj.iter() {
+        if k.as_str() == Some("after_seq") {
+            if let Some(n) = v.as_u64() {
+                after_seq = n;
+            } else if let Some(n) = v.as_i64() {
+                if n >= 0 {
+                    after_seq = n as u64;
+                }
+            }
+        }
+        if k.as_str() == Some("limit") {
+            if let Some(n) = v.as_u64() {
+                limit = n as usize;
+            } else if let Some(n) = v.as_i64() {
+                if n > 0 {
+                    limit = n as usize;
+                }
+            }
+        }
+    }
+    let max_limit = std::env::var("NEKO_MESSAGE_PLANE_GET_RECENT_MAX_LIMIT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(1000);
+    if limit > max_limit {
+        limit = max_limit;
+    }
+
+    let topic_opt = if topic == "all" || topic == "*" {
+        None
+    } else {
+        Some(topic.as_str())
+    };
+
+    let items = match state.store(&store) {
+        Some(s) => s.get_since("", topic_opt, after_seq, limit),
+        None => return rpc_err(req_id, "BAD_STORE", "invalid store", None),
+    };
+
+    let out_items = events_to_mp_vec(&items, false);
+    rpc_ok(
+        req_id,
+        RpcGetSinceResult {
+            store,
+            topic,
+            items: out_items,
+            after_seq,
         },
     )
 }
@@ -402,8 +486,23 @@ fn handle_publish_mp(
 
     let payload = mp_get(args, "payload").cloned().unwrap_or(MpValue::Nil);
     let payload_bytes = rmp_serde::to_vec_named(&payload).unwrap_or_default();
-    if payload_bytes.len() > payload_max_bytes {
-        return rpc_err(req_id, "BAD_ARGS", "payload too large", None);
+    
+    // Store-specific payload size limits
+    let effective_max_bytes = if store == "runs" {
+        // runs bus: limit to 1MB for large task results
+        let runs_max = 1024 * 1024; // 1MB
+        runs_max.min(payload_max_bytes)
+    } else {
+        payload_max_bytes
+    };
+    
+    if payload_bytes.len() > effective_max_bytes {
+        let msg = if store == "runs" {
+            "payload too large for runs bus (max 1MB)"
+        } else {
+            "payload too large"
+        };
+        return rpc_err(req_id, "BAD_ARGS", msg, None);
     }
 
     let payload_json = match mp_to_json(&payload) {

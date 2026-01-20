@@ -1,13 +1,23 @@
 use rmpv::Value as MpValue;
 use serde_json::Value as JsonValue;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use serde::Serialize;
 
 use crate::utils::extract_index;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoreMetrics {
+    pub total_events: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub total_publishes: u64,
+    pub total_queries: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct Event {
@@ -39,6 +49,11 @@ pub struct Store {
     pub meta: DashMap<String, TopicMeta>,
     // Read cache: lock-free recent events for fast get_recent
     pub read_cache: DashMap<String, Vec<Arc<Event>>>,
+    // Metrics
+    pub metrics_total_publishes: AtomicU64,
+    pub metrics_total_queries: AtomicU64,
+    pub metrics_cache_hits: AtomicU64,
+    pub metrics_cache_misses: AtomicU64,
 }
 
 impl Store {
@@ -50,6 +65,21 @@ impl Store {
             topics: DashMap::new(),
             meta: DashMap::new(),
             read_cache: DashMap::new(),
+            metrics_total_publishes: AtomicU64::new(0),
+            metrics_total_queries: AtomicU64::new(0),
+            metrics_cache_hits: AtomicU64::new(0),
+            metrics_cache_misses: AtomicU64::new(0),
+        }
+    }
+    
+    pub fn get_metrics(&self) -> StoreMetrics {
+        let total_events = self.next_seq.load(Ordering::Relaxed).saturating_sub(1);
+        StoreMetrics {
+            total_events,
+            cache_hits: self.metrics_cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.metrics_cache_misses.load(Ordering::Relaxed),
+            total_publishes: self.metrics_total_publishes.load(Ordering::Relaxed),
+            total_queries: self.metrics_total_queries.load(Ordering::Relaxed),
         }
     }
 
@@ -110,6 +140,9 @@ impl Store {
         // Update read cache (lock-free)
         self.update_read_cache(topic);
         
+        // Update metrics
+        self.metrics_total_publishes.fetch_add(1, Ordering::Relaxed);
+        
         ev
     }
 
@@ -144,10 +177,13 @@ impl Store {
     pub fn get_recent(&self, _store: &str, topic: &str, limit: usize) -> Vec<Arc<Event>> {
         // Fast path: try read cache first (lock-free)
         if let Some(cache) = self.read_cache.get(topic) {
+            self.metrics_cache_hits.fetch_add(1, Ordering::Relaxed);
             let n = limit.min(cache.len());
             let start = cache.len().saturating_sub(n);
             return cache[start..].to_vec();
         }
+        
+        self.metrics_cache_misses.fetch_add(1, Ordering::Relaxed);
         
         // Slow path: read from queue with lock
         let queue = match self.topics.get(topic) {
@@ -170,6 +206,38 @@ impl Store {
             }
         }
     }
+
+    #[inline]
+    pub fn get_since(&self, _store: &str, topic: Option<&str>, after_seq: u64, limit: usize) -> Vec<Arc<Event>> {
+        self.metrics_total_queries.fetch_add(1, Ordering::Relaxed);
+        
+        let topics_to_scan: Vec<String> = match topic {
+            Some(t) if !t.is_empty() && t != "*" => vec![t.to_string()],
+            _ => self.topics.iter().map(|entry| entry.key().clone()).collect(),
+        };
+        
+        let mut snapshots: Vec<Arc<Event>> = Vec::new();
+        for topic_name in topics_to_scan {
+            if let Some(queue_ref) = self.topics.get(&topic_name) {
+                let q = queue_ref.read();
+                for ev in q.iter() {
+                    if ev.seq > after_seq {
+                        snapshots.push(Arc::clone(ev));
+                    }
+                }
+            }
+        }
+        
+        // Sort by seq ascending
+        snapshots.sort_by_key(|ev| ev.seq);
+        
+        // Apply limit
+        if snapshots.len() > limit {
+            snapshots.truncate(limit);
+        }
+        
+        snapshots
+    }
 }
 
 #[derive(Debug)]
@@ -184,9 +252,36 @@ pub struct MpState {
 impl MpState {
     pub fn new(maxlen: usize, topic_max: usize) -> Self {
         let stores = DashMap::new();
-        for name in ["messages", "events", "lifecycle", "runs", "export", "memory"] {
-            stores.insert(name.to_string(), Store::new(maxlen, topic_max));
-        }
+        
+        // Bus-specific configurations for optimal memory usage
+        // messages: high-frequency read/write, needs full capacity
+        stores.insert("messages".to_string(), Store::new(maxlen, topic_max));
+        
+        // events: medium-frequency writes, moderate capacity
+        let events_maxlen = (maxlen / 2).max(10000);
+        let events_topic_max = (topic_max / 2).max(1000);
+        stores.insert("events".to_string(), Store::new(events_maxlen, events_topic_max));
+        
+        // lifecycle: low-frequency critical events, small capacity
+        let lifecycle_maxlen = (maxlen / 20).max(1000);
+        let lifecycle_topic_max = (topic_max / 4).max(500);
+        stores.insert("lifecycle".to_string(), Store::new(lifecycle_maxlen, lifecycle_topic_max));
+        
+        // runs: low-frequency large objects, very small capacity
+        let runs_maxlen = (maxlen / 40).max(500);
+        let runs_topic_max = (topic_max / 10).max(200);
+        stores.insert("runs".to_string(), Store::new(runs_maxlen, runs_topic_max));
+        
+        // export: temporary buffer, moderate capacity
+        let export_maxlen = (maxlen / 4).max(5000);
+        let export_topic_max = (topic_max / 4).max(500);
+        stores.insert("export".to_string(), Store::new(export_maxlen, export_topic_max));
+        
+        // memory: context storage, moderate capacity
+        let memory_maxlen = (maxlen / 10).max(2000);
+        let memory_topic_max = (topic_max / 2).max(1000);
+        stores.insert("memory".to_string(), Store::new(memory_maxlen, memory_topic_max));
+        
         Self {
             maxlen,
             topic_max,
@@ -194,7 +289,7 @@ impl MpState {
         }
     }
 
-    pub fn store(&self, name: &str) -> Option<dashmap::mapref::one::Ref<String, Store>> {
+    pub fn store(&self, name: &str) -> Option<dashmap::mapref::one::Ref<'_, String, Store>> {
         self.stores.get(name)
     }
 }

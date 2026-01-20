@@ -80,3 +80,11 @@ pub struct RpcPublishResult {
     pub accepted: bool,
     pub event: MpValue,
 }
+
+#[derive(Serialize)]
+pub struct RpcGetSinceResult {
+    pub store: String,
+    pub topic: String,
+    pub items: Vec<MpValue>,
+    pub after_seq: u64,
+}
